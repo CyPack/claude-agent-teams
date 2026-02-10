@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Claude Code session lookup - session'lari bulur, listeler, gosterir.
+
+Usage:
+    claude-sessions search <name>    # UUID|CWD doner (ca fonksiyonu icin)
+    claude-sessions list             # tum session'lari listeler
+    claude-sessions peek <name>      # session'in son mesajlarini gosterir
+"""
+
+import json, os, glob, sys, time, shutil
+
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+CONFIG_PATH = os.path.expanduser("~/.config/claude-sessions.json")
+
+# --- Config ---
+# ~/.config/claude-sessions.json:
+# {
+#   "sort": "bottom-up",   ← "bottom-up" (yeni altta) veya "top-down" (yeni ustte)
+#   "limit": 100           ← listede gosterilecek max session sayisi
+# }
+_DEFAULT_CONFIG = {"sort": "bottom-up", "limit": 100}
+
+
+def _load_config():
+    """Config dosyasini oku. Yoksa default deger kullan."""
+    cfg = dict(_DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH) as f:
+            user = json.load(f)
+        if user.get("sort") in ("bottom-up", "top-down"):
+            cfg["sort"] = user["sort"]
+        if isinstance(user.get("limit"), int) and user["limit"] > 0:
+            cfg["limit"] = user["limit"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+    return cfg
+
+# ANSI colors
+C_RESET = "\033[0m"
+C_CYAN = "\033[1;36m"
+C_YELLOW = "\033[0;33m"
+C_WHITE = "\033[0;37m"
+C_RED = "\033[1;31m"
+C_DIM = "\033[2m"
+C_GREEN = "\033[0;32m"
+C_BLUE = "\033[0;34m"
+C_MAGENTA = "\033[0;35m"
+
+
+_NOISE_PREFIXES = (
+    "This session is being continued",
+    "[Request interrupted",
+)
+
+
+def _get_msg_text(d):
+    """Parsed JSONL entry'sinden (user veya assistant) text'i cek."""
+    msg = d.get("message", {})
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                text = c.get("text", "").strip()
+                if text:
+                    return text
+    elif isinstance(content, str) and content.strip():
+        return content.strip()
+    return ""
+
+
+def _is_noise(text):
+    """Teknik/meta mesajlari filtrele."""
+    return not text or text.startswith("<") or any(text.startswith(p) for p in _NOISE_PREFIXES)
+
+
+def _project_name(cwd):
+    """CWD'den proje ismini cek."""
+    home = os.path.expanduser("~")
+    if not cwd or cwd.rstrip("/") == home.rstrip("/"):
+        return "~"
+    return os.path.basename(cwd.rstrip("/")) or "~"
+
+
+def _term_width():
+    """Terminal genisligini al."""
+    return shutil.get_terminal_size().columns
+
+
+def scan_sessions(renamed_only=True):
+    """JSONL dosyalarini tarayip session'lari doner."""
+    results = []
+    for projdir in glob.glob(os.path.join(PROJECTS_DIR, "*")):
+        for f in glob.glob(os.path.join(projdir, "*.jsonl")):
+            sid = os.path.basename(f).replace(".jsonl", "")
+            try:
+                cwd = ""
+                custom_title = ""
+                summary_title = ""
+                first_user_text = ""
+                last_user_text = ""
+                last_asst_text = ""
+
+                for line in open(f):
+                    try:
+                        d = json.loads(line)
+                    except:
+                        continue
+                    if not cwd and d.get("cwd"):
+                        cwd = d["cwd"]
+                    if d.get("type") == "custom-title":
+                        custom_title = d.get("customTitle", "")
+                    if d.get("type") == "summary":
+                        summary_title = d.get("summary", "")
+                    if d.get("type") == "user":
+                        text = _get_msg_text(d)
+                        if not _is_noise(text):
+                            if not first_user_text:
+                                first_user_text = text
+                            last_user_text = text
+                    if d.get("type") == "assistant":
+                        text = _get_msg_text(d)
+                        if text and not text.startswith("<"):
+                            last_asst_text = text
+
+                is_renamed = bool(custom_title)
+                if renamed_only and not is_renamed:
+                    continue
+
+                # Title: custom > summary > ilk user mesaji
+                display_title = (custom_title or summary_title
+                                 or first_user_text[:60].replace("\n", " "))
+                if not display_title:
+                    continue
+
+                project = _project_name(cwd) if cwd else "~"
+
+                # Context: son user mesaji (arama icin)
+                context = last_user_text.replace("\n", " ")[:120] if last_user_text else ""
+                # Last AI response (session nerede kaldi)
+                last_ai = last_asst_text.replace("\n", " ")[:200] if last_asst_text else ""
+
+                results.append({
+                    "title": display_title,
+                    "sid": sid,
+                    "cwd": cwd or os.path.expanduser("~"),
+                    "mtime": os.path.getmtime(f),
+                    "size": os.path.getsize(f) / 1024,
+                    "path": f,
+                    "projdir": projdir,
+                    "renamed": is_renamed,
+                    "project": project,
+                    "context": context,
+                    "last_ai": last_ai,
+                })
+            except:
+                pass
+    results.sort(key=lambda x: -x["mtime"])
+    return results
+
+
+def find_match(name):
+    """Isimle eslesme bul. #N ile numara, yoksa title + context + last_ai arar."""
+    all_sessions = scan_sessions(renamed_only=False)
+    scanned_dirs = set()
+    for projdir in glob.glob(os.path.join(PROJECTS_DIR, "*")):
+        scanned_dirs.add(projdir)
+
+    # #N veya saf sayi → liste numarasiyla bul
+    num_str = name.lstrip("#")
+    if num_str.isdigit():
+        renamed = [s for s in all_sessions if s["renamed"]]
+        unnamed = [s for s in all_sessions if not s["renamed"]]
+        cfg = _load_config()
+        show_count = max(0, cfg["limit"] - len(renamed))
+        ordered = renamed + unnamed[:show_count]
+        n = int(num_str)
+        if 1 <= n <= len(ordered):
+            return ordered[n - 1], all_sessions, scanned_dirs
+        return None, all_sessions, scanned_dirs
+
+    search = name.lower()
+    renamed = [s for s in all_sessions if s["renamed"]]
+    unnamed = [s for s in all_sessions if not s["renamed"]]
+
+    # Oncelik: renamed > unnamed
+    # Her pool icinde: exact title > partial title > context (user) > last_ai (assistant)
+    for pool in [renamed, unnamed]:
+        exact = [s for s in pool if s["title"].lower() == search]
+        if exact:
+            return exact[0], all_sessions, scanned_dirs
+        partial = [s for s in pool if search in s["title"].lower()]
+        if partial:
+            return partial[0], all_sessions, scanned_dirs
+        ctx_match = [s for s in pool if search in s.get("context", "").lower()]
+        if ctx_match:
+            return ctx_match[0], all_sessions, scanned_dirs
+        ai_match = [s for s in pool if search in s.get("last_ai", "").lower()]
+        if ai_match:
+            return ai_match[0], all_sessions, scanned_dirs
+
+    return None, all_sessions, scanned_dirs
+
+
+def eprint(*args, **kwargs):
+    """stderr'e yaz."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def print_not_found(name, sessions, scanned_dirs):
+    """Agent-friendly 'bulunamadi' mesaji (stderr'e)."""
+    eprint(f"\n  {C_RED}Session '{name}' bulunamadi.{C_RESET}\n")
+    eprint(f"  {C_DIM}Aranan dizin:{C_RESET}  {PROJECTS_DIR}/")
+    eprint(f"  {C_DIM}Taranan proje:{C_RESET}  {len(scanned_dirs)} dizin")
+    jsonl_count = sum(1 for d in scanned_dirs for _ in glob.glob(os.path.join(d, "*.jsonl")))
+    eprint(f"  {C_DIM}Taranan JSONL:{C_RESET}  {jsonl_count} dosya")
+    eprint(f"  {C_DIM}Aranan alan:{C_RESET}   title + context icinde \"{name}\"")
+    eprint()
+    renamed = [s for s in sessions if s.get("renamed")]
+    if renamed:
+        eprint(f"  {C_GREEN}Renamed session'lar:{C_RESET}")
+        for s in renamed[:10]:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"]))
+            eprint(f"    {C_CYAN}{s['title']:20s}{C_RESET}  {ts}")
+    recent = [s for s in sessions if not s.get("renamed")][:5]
+    if recent:
+        eprint(f"\n  {C_DIM}Son unnamed session'lar:{C_RESET}")
+        for s in recent:
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"]))
+            title = s["title"][:40]
+            eprint(f"    {C_WHITE}{title:42s}{C_RESET}  {ts}")
+    eprint(f"\n  {C_DIM}Ipucu: ca -l ile tum session'lari gor.{C_RESET}")
+    eprint()
+
+
+def print_cwd_warning(match):
+    """CWD dizini yoksa agent-friendly uyari (stderr'e)."""
+    cwd = match["cwd"]
+    if os.path.isdir(cwd):
+        return False
+    eprint(f"\n  {C_YELLOW}CWD dizini bulunamadi!{C_RESET}\n")
+    eprint(f"  {C_DIM}Session:{C_RESET}      {C_CYAN}{match['title']}{C_RESET}")
+    eprint(f"  {C_DIM}UUID:{C_RESET}         {match['sid']}")
+    eprint(f"  {C_DIM}JSONL:{C_RESET}        {match['path']}")
+    eprint(f"  {C_DIM}Kayitli CWD:{C_RESET}  {C_RED}{cwd}{C_RESET}  <- bu dizin artik yok")
+    eprint()
+    parts = cwd.rstrip("/").split("/")
+    for i in range(len(parts), 0, -1):
+        parent = "/".join(parts[:i]) or "/"
+        if os.path.isdir(parent):
+            eprint(f"  {C_DIM}En yakin mevcut parent:{C_RESET}  {C_GREEN}{parent}{C_RESET}")
+            break
+    eprint(f"\n  {C_DIM}Ipucu: Session ~ (home) dizininden resume edilecek.{C_RESET}")
+    eprint()
+    return True
+
+
+def cmd_search(name):
+    """Session ara, UUID|CWD dondur. #N ile numara ile de acilabilir."""
+    match, sessions, scanned_dirs = find_match(name)
+    if not match:
+        print_not_found(name, sessions, scanned_dirs)
+        sys.exit(1)
+
+    cwd = match["cwd"]
+    if not os.path.isdir(cwd):
+        print_cwd_warning(match)
+        cwd = os.path.expanduser("~")
+
+    print(f'{match["sid"]}|{cwd}')
+
+
+def cmd_list():
+    """Tum session'lari listele — renamed ve unnamed."""
+    cfg = _load_config()
+    sort_order = cfg["sort"]      # "bottom-up" veya "top-down"
+    limit = cfg["limit"]          # max gosterilecek session
+
+    all_sessions = scan_sessions(renamed_only=False)
+    if not all_sessions:
+        print(f"\n  {C_YELLOW}Hic session bulunamadi.{C_RESET}\n")
+        return
+
+    renamed = [s for s in all_sessions if s["renamed"]]
+    unnamed = [s for s in all_sessions if not s["renamed"]]
+    tw = _term_width()
+
+    def fmt_size(kb):
+        return f"{kb:.0f}K" if kb < 1024 else f"{kb/1024:.1f}M"
+
+    def proj_tag(s):
+        p = s["project"]
+        if p == "~":
+            return "", 0
+        tag_text = p[:16]
+        return f"{C_BLUE}[{tag_text}]{C_RESET} ", len(tag_text) + 3
+
+    show_count = max(0, limit - len(renamed))
+
+    # Pre-index: #1 = en yeni renamed
+    renamed_items = [(i + 1, s) for i, s in enumerate(renamed)]
+    unnamed_items = [(len(renamed) + i + 1, s) for i, s in enumerate(unnamed[:show_count])]
+
+    def print_renamed():
+        if not renamed:
+            return
+        print(f"\n  {C_GREEN}Renamed Sessions ({len(renamed)}){C_RESET}  {C_DIM}— ca <isim> veya ca #N ile resume et{C_RESET}\n")
+        items = reversed(renamed_items) if sort_order == "bottom-up" else renamed_items
+        for idx, s in items:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(s["mtime"]))
+            size = fmt_size(s["size"])
+            tag, tag_len = proj_tag(s)
+            desc_width = max(20, tw - 46 - tag_len)
+            ai = s["last_ai"][:desc_width] if s["last_ai"] else s["context"][:desc_width]
+            print(f"  {C_DIM}{idx:>3d}{C_RESET} {ts}  {size:>5s}  {C_CYAN}{s['title']:18s}{C_RESET}  {tag}{C_DIM}{ai}{C_RESET}")
+
+    def print_unnamed():
+        if not unnamed:
+            return
+        remaining = len(unnamed) - show_count
+        if sort_order == "bottom-up" and remaining > 0:
+            print(f"\n  {C_DIM}... ve {remaining} eski session daha{C_RESET}")
+        print(f"\n  {C_DIM}Other Sessions ({len(unnamed)}){C_RESET}  {C_DIM}— ca #N ile ac | /rename ile isimlendir{C_RESET}\n")
+        items = reversed(unnamed_items) if sort_order == "bottom-up" else unnamed_items
+        for idx, s in items:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(s["mtime"]))
+            size = fmt_size(s["size"])
+            tag, tag_len = proj_tag(s)
+            desc_width = max(20, tw - 26 - tag_len)
+            ai = s["last_ai"][:desc_width] if s["last_ai"] else (s["context"] or s["title"])[:desc_width]
+            print(f"  {C_DIM}{idx:>3d}{C_RESET} {ts}  {size:>5s}  {tag}{C_WHITE}{ai}{C_RESET}")
+        if sort_order == "top-down" and remaining > 0:
+            print(f"  {C_DIM}... ve {remaining} session daha{C_RESET}")
+
+    # bottom-up: unnamed (eski->yeni) sonra renamed (eski->yeni), en yeni en altta
+    # top-down:  renamed (yeni->eski) sonra unnamed (yeni->eski), en yeni en ustte
+    if sort_order == "bottom-up":
+        print_unnamed()
+        print_renamed()
+    else:
+        print_renamed()
+        print_unnamed()
+
+    print(f"\n  {C_DIM}Toplam: {len(all_sessions)} session ({len(renamed)} renamed, {len(unnamed)} unnamed){C_RESET}")
+    print()
+
+
+def cmd_peek(name):
+    """Session'in son kullanici/asistan mesajlarini goster."""
+    match, sessions, scanned_dirs = find_match(name)
+    if not match:
+        print_not_found(name, sessions, scanned_dirs)
+        sys.exit(1)
+
+    messages = []
+    for line in open(match["path"]):
+        try:
+            d = json.loads(line)
+        except:
+            continue
+        t = d.get("type", "")
+        if t not in ("user", "assistant"):
+            continue
+        text = _get_msg_text(d)
+        if text and not text.startswith("<"):
+            role = "USER" if t == "user" else "ASST"
+            messages.append((role, text))
+
+    ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(match["mtime"]))
+    tw = _term_width()
+    cwd_ok = os.path.isdir(match["cwd"])
+    cwd_line = match["cwd"] if cwd_ok else f'{C_RED}{match["cwd"]}  (dizin yok!){C_RESET}'
+    print(f'\n  {C_CYAN}{match["title"]}{C_RESET}  ({ts})  {C_BLUE}{match.get("project", "")}{C_RESET}')
+    print(f'  {cwd_line}')
+    print(f'  {"─" * min(70, tw - 4)}')
+
+    preview_width = max(40, tw - 10)
+    for role, text in messages[-6:]:
+        preview = text[:preview_width].replace("\n", " ")
+        color = C_YELLOW if role == "USER" else C_WHITE
+        print(f"  {color}{role:4s}{C_RESET}  {preview}")
+    print()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    if cmd == "search" and len(sys.argv) >= 3:
+        cmd_search(sys.argv[2])
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "peek" and len(sys.argv) >= 3:
+        cmd_peek(sys.argv[2])
+    else:
+        print(__doc__)
+        sys.exit(1)
