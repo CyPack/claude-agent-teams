@@ -80,6 +80,7 @@ ca nvidia                             (veya ca #17)
 ```
 ~/.local/bin/claude-sessions          # Python helper (search|list|peek)
 ~/.config/claude-sessions.json        # Config (siralama, limit)
+~/.config/ghostty/config              # Ghostty terminal ayarlari
 ~/.config/fish/config.fish            # Fish shell ca/cc fonksiyonlari
 ~/.tmux.conf                          # tmux ayarlari (mouse, renkler)
 ~/.claude/settings.json               # Claude Code ayarlari (env)
@@ -140,6 +141,29 @@ tmux icindeysen reload et:
 ```bash
 tmux source-file ~/.tmux.conf
 ```
+
+---
+
+## Adim 1b: Ghostty Config (Ghostty Kullanicilariysa)
+
+Split view'da mouse hangi pane'in uzerindeyse focus otomatik oraya gecer — ekstra tiklamaya gerek kalmaz.
+
+Repo'daki [`ghostty.conf`](ghostty.conf) dosyasindaki ayarlari `~/.config/ghostty/config` dosyasina ekle:
+
+```bash
+# Ghostty config dizini yoksa olustur
+mkdir -p ~/.config/ghostty
+
+# Ayari ekle (zaten varsa atlayabilirsin)
+cat >> ~/.config/ghostty/config << 'EOF'
+
+# Mouse - split view'da focus follows mouse
+focus-follows-mouse = true
+EOF
+```
+
+> **Not:** Ghostty'yi yeniden baslat veya config reload et (`Cmd+,`).
+> Bu ayar Ghostty split'leri ve tmux pane'leri icin de ise yarar.
 
 ---
 
@@ -1012,6 +1036,7 @@ Create an agent team with 2 teammates:
 [ ] tmux kurulu ve >= 3.2
 [ ] ~/.tmux.conf olusturuldu
 [ ] ~/.local/bin/claude-sessions olusturuldu ve +x
+[ ] Ghostty: focus-follows-mouse = true (Ghostty kullanicilariysa)
 [ ] Shell config'e ca fonksiyonu eklendi (fish veya bash/zsh)
 [ ] ca komutu calisiyor (yeni terminal'den test)
 [ ] ca -l renamed session'lari listeliyor
