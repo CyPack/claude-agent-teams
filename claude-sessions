@@ -8,6 +8,7 @@ Usage:
 """
 
 import json, os, glob, sys, time, shutil
+from collections import defaultdict
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CONFIG_PATH = os.path.expanduser("~/.config/claude-sessions.json")
@@ -18,7 +19,7 @@ CONFIG_PATH = os.path.expanduser("~/.config/claude-sessions.json")
 #   "sort": "bottom-up",   ← "bottom-up" (yeni altta) veya "top-down" (yeni ustte)
 #   "limit": 100           ← listede gosterilecek max session sayisi
 # }
-_DEFAULT_CONFIG = {"sort": "bottom-up", "limit": 100}
+_DEFAULT_CONFIG = {"sort": "bottom-up", "limit": 100, "per_dir_limit": 10}
 
 
 def _load_config():
@@ -31,6 +32,8 @@ def _load_config():
             cfg["sort"] = user["sort"]
         if isinstance(user.get("limit"), int) and user["limit"] > 0:
             cfg["limit"] = user["limit"]
+        if isinstance(user.get("per_dir_limit"), int) and user["per_dir_limit"] > 0:
+            cfg["per_dir_limit"] = user["per_dir_limit"]
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         pass
     return cfg
@@ -128,9 +131,11 @@ def scan_sessions(renamed_only=True):
                 if renamed_only and not is_renamed:
                     continue
 
-                # Title: custom > summary > ilk user mesaji
+                # Title: custom > summary > ilk user > son user > son AI
                 display_title = (custom_title or summary_title
-                                 or first_user_text[:60].replace("\n", " "))
+                                 or first_user_text[:60].replace("\n", " ")
+                                 or last_user_text[:60].replace("\n", " ")
+                                 or last_asst_text[:60].replace("\n", " "))
                 if not display_title:
                     continue
 
@@ -160,6 +165,17 @@ def scan_sessions(renamed_only=True):
     return results
 
 
+def _flat_ordered_list(all_sessions, cfg):
+    """cmd_list ile ayni sirada flat liste olustur (numara indexleme icin)."""
+    dir_groups = _build_dir_ordered_list(all_sessions, cfg)
+    sort_order = cfg["sort"]
+    ordered = []
+    for _cwd, _latest_mtime, sessions, _total in dir_groups:
+        items = list(reversed(sessions)) if sort_order == "bottom-up" else list(sessions)
+        ordered.extend(items)
+    return ordered
+
+
 def find_match(name):
     """Isimle eslesme bul. #N ile numara, yoksa title + context + last_ai arar."""
     all_sessions = scan_sessions(renamed_only=False)
@@ -167,38 +183,32 @@ def find_match(name):
     for projdir in glob.glob(os.path.join(PROJECTS_DIR, "*")):
         scanned_dirs.add(projdir)
 
-    # #N veya saf sayi → liste numarasiyla bul
+    cfg = _load_config()
+
+    # #N veya saf sayi → liste numarasiyla bul (dizin bazli siralama ile ayni)
     num_str = name.lstrip("#")
     if num_str.isdigit():
-        renamed = [s for s in all_sessions if s["renamed"]]
-        unnamed = [s for s in all_sessions if not s["renamed"]]
-        cfg = _load_config()
-        show_count = max(0, cfg["limit"] - len(renamed))
-        ordered = renamed + unnamed[:show_count]
+        ordered = _flat_ordered_list(all_sessions, cfg)
         n = int(num_str)
         if 1 <= n <= len(ordered):
             return ordered[n - 1], all_sessions, scanned_dirs
         return None, all_sessions, scanned_dirs
 
     search = name.lower()
-    renamed = [s for s in all_sessions if s["renamed"]]
-    unnamed = [s for s in all_sessions if not s["renamed"]]
 
-    # Oncelik: renamed > unnamed
-    # Her pool icinde: exact title > partial title > context (user) > last_ai (assistant)
-    for pool in [renamed, unnamed]:
-        exact = [s for s in pool if s["title"].lower() == search]
-        if exact:
-            return exact[0], all_sessions, scanned_dirs
-        partial = [s for s in pool if search in s["title"].lower()]
-        if partial:
-            return partial[0], all_sessions, scanned_dirs
-        ctx_match = [s for s in pool if search in s.get("context", "").lower()]
-        if ctx_match:
-            return ctx_match[0], all_sessions, scanned_dirs
-        ai_match = [s for s in pool if search in s.get("last_ai", "").lower()]
-        if ai_match:
-            return ai_match[0], all_sessions, scanned_dirs
+    # Oncelik: exact title > partial title > context (user) > last_ai (assistant)
+    exact = [s for s in all_sessions if s["title"].lower() == search]
+    if exact:
+        return exact[0], all_sessions, scanned_dirs
+    partial = [s for s in all_sessions if search in s["title"].lower()]
+    if partial:
+        return partial[0], all_sessions, scanned_dirs
+    ctx_match = [s for s in all_sessions if search in s.get("context", "").lower()]
+    if ctx_match:
+        return ctx_match[0], all_sessions, scanned_dirs
+    ai_match = [s for s in all_sessions if search in s.get("last_ai", "").lower()]
+    if ai_match:
+        return ai_match[0], all_sessions, scanned_dirs
 
     return None, all_sessions, scanned_dirs
 
@@ -271,78 +281,102 @@ def cmd_search(name):
     print(f'{match["sid"]}|{cwd}')
 
 
+def _short_path(cwd):
+    """CWD'yi ~ ile kisalt."""
+    home = os.path.expanduser("~")
+    if cwd == home or cwd == home + "/":
+        return "~"
+    if cwd.startswith(home + "/"):
+        return "~/" + cwd[len(home) + 1:]
+    return cwd
+
+
+def _build_dir_ordered_list(all_sessions, cfg):
+    """Session'lari dizin bazli grupla, gruplari son mtime'a gore sirala.
+
+    Returns: list of (dir_path, [sessions]) tuples, siralanmis.
+    Her dizin icindeki session'lar mtime'a gore siralanmis (en yeni once).
+    per_dir_limit uygulanmis.
+    """
+    per_dir_limit = cfg["per_dir_limit"]
+    sort_order = cfg["sort"]
+
+    # Dizine gore grupla
+    by_dir = defaultdict(list)
+    for s in all_sessions:
+        by_dir[s["cwd"]].append(s)
+
+    # Her dizin icinde mtime'a gore sirala (en yeni once)
+    for cwd in by_dir:
+        by_dir[cwd].sort(key=lambda x: -x["mtime"])
+
+    # Dizinleri en yeni session'a gore sirala
+    dir_groups = []
+    for cwd, sessions in by_dir.items():
+        latest_mtime = sessions[0]["mtime"]
+        dir_groups.append((cwd, latest_mtime, sessions[:per_dir_limit], len(sessions)))
+
+    # sort_order: top-down = en yeni dizin ustte, bottom-up = en yeni dizin altta
+    if sort_order == "top-down":
+        dir_groups.sort(key=lambda x: -x[1])  # en yeni once
+    else:
+        dir_groups.sort(key=lambda x: x[1])   # en eski once (en yeni altta)
+
+    return dir_groups
+
+
 def cmd_list():
-    """Tum session'lari listele — renamed ve unnamed."""
+    """Tum session'lari listele — dizin bazli gruplama."""
     cfg = _load_config()
-    sort_order = cfg["sort"]      # "bottom-up" veya "top-down"
-    limit = cfg["limit"]          # max gosterilecek session
+    sort_order = cfg["sort"]
+    tw = _term_width()
 
     all_sessions = scan_sessions(renamed_only=False)
     if not all_sessions:
         print(f"\n  {C_YELLOW}Hic session bulunamadi.{C_RESET}\n")
         return
 
-    renamed = [s for s in all_sessions if s["renamed"]]
-    unnamed = [s for s in all_sessions if not s["renamed"]]
-    tw = _term_width()
+    dir_groups = _build_dir_ordered_list(all_sessions, cfg)
 
     def fmt_size(kb):
         return f"{kb:.0f}K" if kb < 1024 else f"{kb/1024:.1f}M"
 
-    def proj_tag(s):
-        p = s["project"]
-        if p == "~":
-            return "", 0
-        tag_text = p[:16]
-        return f"{C_BLUE}[{tag_text}]{C_RESET} ", len(tag_text) + 3
+    # Global numara sayaci
+    idx = 1
+    total_shown = 0
 
-    show_count = max(0, limit - len(renamed))
+    for cwd, _latest_mtime, sessions, total_in_dir in dir_groups:
+        short = _short_path(cwd)
+        hidden = total_in_dir - len(sessions)
+        count_label = f"{total_in_dir} chat" if hidden == 0 else f"{len(sessions)}/{total_in_dir} chat"
 
-    # Pre-index: #1 = en yeni renamed
-    renamed_items = [(i + 1, s) for i, s in enumerate(renamed)]
-    unnamed_items = [(len(renamed) + i + 1, s) for i, s in enumerate(unnamed[:show_count])]
+        print(f"\n  {C_GREEN}{short}{C_RESET}  {C_DIM}({count_label}){C_RESET}")
+        print(f"  {'─' * min(50, tw - 4)}")
 
-    def print_renamed():
-        if not renamed:
-            return
-        print(f"\n  {C_GREEN}Renamed Sessions ({len(renamed)}){C_RESET}  {C_DIM}— ca <isim> veya ca #N ile resume et{C_RESET}\n")
-        items = reversed(renamed_items) if sort_order == "bottom-up" else renamed_items
-        for idx, s in items:
+        # bottom-up: her dizin icinde eski->yeni (en yeni altta)
+        items = reversed(sessions) if sort_order == "bottom-up" else sessions
+        local_entries = []
+        for s in items:
             ts = time.strftime("%m-%d %H:%M", time.localtime(s["mtime"]))
             size = fmt_size(s["size"])
-            tag, tag_len = proj_tag(s)
-            desc_width = max(20, tw - 46 - tag_len)
-            ai = s["last_ai"][:desc_width] if s["last_ai"] else s["context"][:desc_width]
-            print(f"  {C_DIM}{idx:>3d}{C_RESET} {ts}  {size:>5s}  {C_CYAN}{s['title']:18s}{C_RESET}  {tag}{C_DIM}{ai}{C_RESET}")
+            desc_width = max(20, tw - 28)
+            # Title: custom_title > ilk satir > last_ai
+            title = s["title"]
+            if len(title) > desc_width:
+                title = title[:desc_width - 1] + "…"
+            # Renamed session'lar cyan, diger white
+            title_color = C_CYAN if s["renamed"] else C_WHITE
+            local_entries.append((idx, ts, size, title, title_color))
+            idx += 1
 
-    def print_unnamed():
-        if not unnamed:
-            return
-        remaining = len(unnamed) - show_count
-        if sort_order == "bottom-up" and remaining > 0:
-            print(f"\n  {C_DIM}... ve {remaining} eski session daha{C_RESET}")
-        print(f"\n  {C_DIM}Other Sessions ({len(unnamed)}){C_RESET}  {C_DIM}— ca #N ile ac | /rename ile isimlendir{C_RESET}\n")
-        items = reversed(unnamed_items) if sort_order == "bottom-up" else unnamed_items
-        for idx, s in items:
-            ts = time.strftime("%m-%d %H:%M", time.localtime(s["mtime"]))
-            size = fmt_size(s["size"])
-            tag, tag_len = proj_tag(s)
-            desc_width = max(20, tw - 26 - tag_len)
-            ai = s["last_ai"][:desc_width] if s["last_ai"] else (s["context"] or s["title"])[:desc_width]
-            print(f"  {C_DIM}{idx:>3d}{C_RESET} {ts}  {size:>5s}  {tag}{C_WHITE}{ai}{C_RESET}")
-        if sort_order == "top-down" and remaining > 0:
-            print(f"  {C_DIM}... ve {remaining} session daha{C_RESET}")
+        for n, ts, size, title, title_color in local_entries:
+            print(f"  {C_DIM}{n:>4d}{C_RESET}  {C_DIM}{ts}{C_RESET}  {size:>5s}  {title_color}{title}{C_RESET}")
+            total_shown += 1
 
-    # bottom-up: unnamed (eski->yeni) sonra renamed (eski->yeni), en yeni en altta
-    # top-down:  renamed (yeni->eski) sonra unnamed (yeni->eski), en yeni en ustte
-    if sort_order == "bottom-up":
-        print_unnamed()
-        print_renamed()
-    else:
-        print_renamed()
-        print_unnamed()
+        if hidden > 0:
+            print(f"  {C_DIM}      ... ve {hidden} eski chat daha{C_RESET}")
 
-    print(f"\n  {C_DIM}Toplam: {len(all_sessions)} session ({len(renamed)} renamed, {len(unnamed)} unnamed){C_RESET}")
+    print(f"\n  {C_DIM}Toplam: {len(all_sessions)} session, {len(dir_groups)} dizin{C_RESET}  {C_DIM}— ca #N ile resume et{C_RESET}")
     print()
 
 
